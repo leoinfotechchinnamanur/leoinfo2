@@ -1,235 +1,300 @@
 <?php
-// admin/analytics.php – Platform Analytics Dashboard
-
 define('AKKUAPPS_LOADED', true);
-require_once __DIR__ . '/../includes/functions.php';
-require_once __DIR__ . '/../includes/economy.php';
-requireLogin();
+require_once '../includes/config.php';
+require_once '../includes/functions.php';
 
 $user = getCurrentUser();
-if (empty($user) || $user['role'] !== 'admin') {
-    header('Location: /user/dashboard.php?error=unauthorized');
+if (!$user || $user['role'] !== 'admin') {
+    header("Location: /auth/login.php");
     exit;
 }
 
-$pageTitle = 'Analytics';
-
-// Daily stats (last 30 days)
-$dailyStats = [];
+// Get analytics data
 try {
-    $dailyStats = $pdo->query("
-        SELECT 
-            DATE(created_at) as date,
-            COUNT(*) as new_users,
-            SUM(CASE WHEN reference_type IN ('like_given', 'comment_given') THEN ABS(amount) ELSE 0 END) as interactions
-        FROM users
-        LEFT JOIN coin_transactions ON DATE(coin_transactions.created_at) = DATE(users.created_at)
-        WHERE users.created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)
+    global $pdo;
+    
+    // User statistics
+    $stmt = $pdo->prepare("SELECT COUNT(*) FROM users WHERE created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)");
+    $stmt->execute();
+    $newUsers30Days = $stmt->fetchColumn();
+    
+    $stmt = $pdo->prepare("SELECT COUNT(*) FROM users");
+    $stmt->execute();
+    $totalUsers = $stmt->fetchColumn();
+    
+    // Post statistics
+    $stmt = $pdo->prepare("SELECT COUNT(*) FROM user_posts WHERE created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)");
+    $stmt->execute();
+    $newPosts30Days = $stmt->fetchColumn();
+    
+    $stmt = $pdo->prepare("SELECT COUNT(*) FROM user_posts");
+    $stmt->execute();
+    $totalPosts = $stmt->fetchColumn();
+    
+    // Engagement statistics
+    $stmt = $pdo->prepare("SELECT COUNT(*) FROM post_likes WHERE created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)");
+    $stmt->execute();
+    $likes30Days = $stmt->fetchColumn();
+    
+    $stmt = $pdo->prepare("SELECT COUNT(*) FROM post_comments WHERE created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)");
+    $stmt->execute();
+    $comments30Days = $stmt->fetchColumn();
+    
+    // Revenue statistics
+    $stmt = $pdo->prepare("SELECT SUM(fee_amount) FROM akku_collection_box WHERE created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)");
+    $stmt->execute();
+    $revenue30Days = $stmt->fetchColumn() ?: 0;
+    
+    // Daily user growth data (last 30 days)
+    $stmt = $pdo->prepare("
+        SELECT DATE(created_at) as date, COUNT(*) as count
+        FROM users 
+        WHERE created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)
         GROUP BY DATE(created_at)
-        ORDER BY date DESC
-    ")->fetchAll();
-} catch (Exception $e) {}
-
-// Top earners
-$topEarners = [];
-try {
-    $topEarners = $pdo->query("
-        SELECT user_id, name, coin_balance,
-               (SELECT COUNT(*) FROM user_posts WHERE user_id = users.user_id) as posts
-        FROM users
-        ORDER BY coin_balance DESC
+        ORDER BY date
+    ");
+    $stmt->execute();
+    $dailyUserGrowth = $stmt->fetchAll();
+    
+    // Top creators by engagement
+    $stmt = $pdo->prepare("
+        SELECT u.name, u.user_id, 
+               COUNT(pl.like_id) as likes_received,
+               COUNT(pc.comment_id) as comments_received
+        FROM users u
+        LEFT JOIN user_posts up ON u.user_id = up.user_id
+        LEFT JOIN post_likes pl ON up.post_id = pl.post_id
+        LEFT JOIN post_comments pc ON up.post_id = pc.post_id
+        WHERE u.role != 'admin'
+        GROUP BY u.user_id
+        ORDER BY (COUNT(pl.like_id) + COUNT(pc.comment_id)) DESC
         LIMIT 10
-    ")->fetchAll();
-} catch (Exception $e) {}
-
-// Coin flow (last 7 days)
-$coinFlow = [];
-try {
-    $coinFlow = $pdo->query("
-        SELECT 
-            DATE(created_at) as date,
-            SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END) as inflow,
-            SUM(CASE WHEN amount < 0 THEN ABS(amount) ELSE 0 END) as outflow
-        FROM coin_transactions
-        WHERE created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)
-        GROUP BY DATE(created_at)
-        ORDER BY date DESC
-    ")->fetchAll();
-} catch (Exception $e) {}
-
-include __DIR__ . '/../includes/header.php';
+    ");
+    $stmt->execute();
+    $topCreators = $stmt->fetchAll();
+    
+} catch (Exception $e) {
+    error_log("Analytics error: " . $e->getMessage());
+    $newUsers30Days = 0;
+    $totalUsers = 0;
+    $newPosts30Days = 0;
+    $totalPosts = 0;
+    $likes30Days = 0;
+    $comments30Days = 0;
+    $revenue30Days = 0;
+    $dailyUserGrowth = [];
+    $topCreators = [];
+}
 ?>
-
-<style>
-    :root {
-        --bg: #08080c;
-        --card: #0f0f14;
-        --border: #1a1a22;
-        --text: #a1a1aa;
-        --bright: #ffffff;
-        --accent: #6366f1;
-        --green: #10b981;
-        --red: #ef4444;
-    }
-    .analytics-wrap { max-width: 1200px; margin: 0 auto; padding: 16px; }
-    .analytics-header { margin-bottom: 20px; }
-    .analytics-header h1 { font-size: 24px; color: var(--bright); font-weight: 800; }
-
-    .chart-card {
-        background: var(--card);
-        border: 1px solid var(--border);
-        border-radius: 14px;
-        padding: 24px;
-        margin-bottom: 20px;
-    }
-    .chart-card h2 {
-        font-size: 18px;
-        color: var(--bright);
-        margin-bottom: 16px;
-        font-weight: 700;
-    }
-
-    .bar-chart {
-        display: flex;
-        flex-direction: column;
-        gap: 10px;
-    }
-    .bar-row {
-        display: flex;
-        align-items: center;
-        gap: 12px;
-    }
-    .bar-label {
-        width: 80px;
-        font-size: 12px;
-        color: var(--text);
-        text-align: right;
-        font-weight: 500;
-    }
-    .bar-track {
-        flex: 1;
-        height: 24px;
-        background: #1a1a22;
-        border-radius: 6px;
-        overflow: hidden;
-    }
-    .bar-fill {
-        height: 100%;
-        border-radius: 6px;
-        transition: width 0.5s ease;
-    }
-    .bar-value {
-        width: 60px;
-        font-size: 12px;
-        font-weight: 700;
-        color: var(--bright);
-    }
-
-    .top-list {
-        display: flex;
-        flex-direction: column;
-        gap: 8px;
-    }
-    .top-item {
-        display: flex;
-        align-items: center;
-        gap: 12px;
-        padding: 12px;
-        background: #1a1a22;
-        border-radius: 10px;
-    }
-    .top-rank {
-        width: 30px; height: 30px;
-        border-radius: 50%;
-        background: var(--accent);
-        display: flex; align-items: center; justify-content: center;
-        color: white; font-weight: 800; font-size: 14px;
-    }
-    .top-info { flex: 1; }
-    .top-name { font-weight: 700; color: var(--bright); font-size: 14px; }
-    .top-meta { font-size: 12px; color: var(--text); }
-    .top-coins { color: var(--green); font-weight: 800; font-size: 16px; }
-
-    @media (max-width: 768px) {
-        .bar-label { width: 60px; font-size: 11px; }
-        .bar-value { width: 50px; font-size: 11px; }
-    }
-</style>
-
-<div class="analytics-wrap">
-    <div class="analytics-header">
-        <h1><span class="emoji">📊</span> Platform Analytics</h1>
-    </div>
-
-    <!-- Daily Activity -->
-    <div class="chart-card">
-        <h2>📅 Daily Activity (Last 30 Days)</h2>
-        <div class="bar-chart">
-            <?php 
-            $maxUsers = max(array_column($dailyStats, 'new_users')) ?: 1;
-            foreach ($dailyStats as $day): 
-                $pct = ($day['new_users'] / $maxUsers) * 100;
-            ?>
-            <div class="bar-row">
-                <div class="bar-label"><?= date('M d', strtotime($day['date'])) ?></div>
-                <div class="bar-track">
-                    <div class="bar-fill" style="width: <?= $pct ?>%; background: var(--accent);"></div>
-                </div>
-                <div class="bar-value"><?= $day['new_users'] ?> users</div>
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Analytics Dashboard - AkkuApps Admin</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link rel="stylesheet" href="../assets/css/themes.css?v=<?= time() ?>">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+    <?php include '../components/admin-header.php'; ?>
+    
+    <div class="dashboard-container">
+        <?php include '../components/admin-sidebar.php'; ?>
+        
+        <main class="main-content">
+            <div class="welcome-banner">
+                <h1>Analytics Dashboard</h1>
+                <p>Platform performance and growth metrics</p>
             </div>
-            <?php endforeach; ?>
-            <?php if (empty($dailyStats)): ?>
-                <p style="color: var(--text); text-align: center;">No data yet</p>
-            <?php endif; ?>
-        </div>
-    </div>
 
-    <!-- Coin Flow -->
-    <div class="chart-card">
-        <h2>💰 Coin Flow (Last 7 Days)</h2>
-        <div class="bar-chart">
-            <?php 
-            $maxFlow = max(array_merge(array_column($coinFlow, 'inflow'), array_column($coinFlow, 'outflow'))) ?: 1;
-            foreach ($coinFlow as $flow): 
-            ?>
-            <div class="bar-row">
-                <div class="bar-label"><?= date('M d', strtotime($flow['date'])) ?></div>
-                <div style="flex: 1; display: flex; gap: 4px;">
-                    <div class="bar-track" style="flex: 1;">
-                        <div class="bar-fill" style="width: <?= ($flow['inflow'] / $maxFlow) * 100 ?>%; background: var(--green);"></div>
+            <!-- Summary Cards -->
+            <div class="stats-grid animate-slideUp">
+                <div class="stat-card">
+                    <div class="stat-icon bg-blue">
+                        <i class="fas fa-users"></i>
                     </div>
-                    <div class="bar-track" style="flex: 1;">
-                        <div class="bar-fill" style="width: <?= ($flow['outflow'] / $maxFlow) * 100 ?>%; background: var(--red);"></div>
+                    <div class="stat-info">
+                        <h3><?= number_format($totalUsers) ?></h3>
+                        <p>Total Users</p>
                     </div>
                 </div>
-                <div class="bar-value">+<?= number_format($flow['inflow'], 0) ?> / -<?= number_format($flow['outflow'], 0) ?></div>
-            </div>
-            <?php endforeach; ?>
-            <?php if (empty($coinFlow)): ?>
-                <p style="color: var(--text); text-align: center;">No data yet</p>
-            <?php endif; ?>
-        </div>
-    </div>
-
-    <!-- Top Earners -->
-    <div class="chart-card">
-        <h2>🏆 Top Coin Holders</h2>
-        <div class="top-list">
-            <?php foreach ($topEarners as $i => $u): ?>
-            <div class="top-item">
-                <div class="top-rank"><?= $i + 1 ?></div>
-                <div class="top-info">
-                    <div class="top-name"><?= htmlspecialchars($u['name']) ?></div>
-                    <div class="top-meta"><?= $u['posts'] ?> posts</div>
+                
+                <div class="stat-card">
+                    <div class="stat-icon bg-green">
+                        <i class="fas fa-chart-line"></i>
+                    </div>
+                    <div class="stat-info">
+                        <h3><?= number_format($newUsers30Days) ?></h3>
+                        <p>New Users (30 days)</p>
+                    </div>
                 </div>
-                <div class="top-coins">🪙 <?= number_format($u['coin_balance'], 0) ?></div>
+                
+                <div class="stat-card">
+                    <div class="stat-icon bg-purple">
+                        <i class="fas fa-newspaper"></i>
+                    </div>
+                    <div class="stat-info">
+                        <h3><?= number_format($totalPosts) ?></h3>
+                        <p>Total Posts</p>
+                    </div>
+                </div>
+                
+                <div class="stat-card">
+                    <div class="stat-icon bg-orange">
+                        <i class="fas fa-coins"></i>
+                    </div>
+                    <div class="stat-info">
+                        <h3>₹<?= number_format($revenue30Days, 2) ?></h3>
+                        <p>Revenue (30 days)</p>
+                    </div>
+                </div>
             </div>
-            <?php endforeach; ?>
-            <?php if (empty($topEarners)): ?>
-                <p style="color: var(--text); text-align: center;">No users yet</p>
-            <?php endif; ?>
-        </div>
-    </div>
-</div>
 
-<?php include __DIR__ . '/../includes/footer.php'; ?>
+            <!-- Charts Section -->
+            <div class="charts-section animate-slideUp">
+                <div class="chart-container">
+                    <h2>User Growth (Last 30 Days)</h2>
+                    <canvas id="userGrowthChart" style="height: 300px;"></canvas>
+                </div>
+                
+                <div class="chart-container">
+                    <h2>Engagement Metrics</h2>
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 20px;">
+                        <div style="text-align: center; padding: 20px; background: var(--secondary-bg); border-radius: 12px;">
+                            <div style="font-size: 2rem; color: var(--accent-color); margin-bottom: 10px;">
+                                <i class="fas fa-heart"></i>
+                            </div>
+                            <h3><?= number_format($likes30Days) ?></h3>
+                            <p>Likes in 30 days</p>
+                        </div>
+                        
+                        <div style="text-align: center; padding: 20px; background: var(--secondary-bg); border-radius: 12px;">
+                            <div style="font-size: 2rem; color: var(--accent-color); margin-bottom: 10px;">
+                                <i class="fas fa-comment"></i>
+                            </div>
+                            <h3><?= number_format($comments30Days) ?></h3>
+                            <p>Comments in 30 days</p>
+                        </div>
+                        
+                        <div style="text-align: center; padding: 20px; background: var(--secondary-bg); border-radius: 12px;">
+                            <div style="font-size: 2rem; color: var(--accent-color); margin-bottom: 10px;">
+                                <i class="fas fa-plus-circle"></i>
+                            </div>
+                            <h3><?= number_format($newPosts30Days) ?></h3>
+                            <p>New Posts in 30 days</p>
+                        </div>
+                        
+                        <div style="text-align: center; padding: 20px; background: var(--secondary-bg); border-radius: 12px;">
+                            <div style="font-size: 2rem; color: var(--accent-color); margin-bottom: 10px;">
+                                <i class="fas fa-share"></i>
+                            </div>
+                            <h3><?= number_format($likes30Days + $comments30Days) ?></h3>
+                            <p>Total Engagements</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Top Creators -->
+            <div class="chart-container animate-slideUp">
+                <h2>Top Creators by Engagement</h2>
+                <div style="margin-top: 20px;">
+                    <?php if (empty($topCreators)): ?>
+                        <p style="color: var(--text-secondary); text-align: center;">No creator data available</p>
+                    <?php else: ?>
+                        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 15px;">
+                            <?php foreach ($topCreators as $creator): ?>
+                                <div style="background: var(--card-bg); border: 1px solid var(--border-color); border-radius: 12px; padding: 20px; text-align: center;">
+                                    <h4 style="color: var(--text-primary); margin-bottom: 10px;"><?= htmlspecialchars($creator['name']) ?></h4>
+                                    <div style="display: flex; justify-content: space-around; margin-top: 15px;">
+                                        <div>
+                                            <div style="font-size: 1.5rem; color: #ef4444;">
+                                                <i class="fas fa-heart"></i>
+                                            </div>
+                                            <div style="color: var(--text-primary);"><?= number_format($creator['likes_received']) ?></div>
+                                            <div style="font-size: 0.8em; color: var(--text-secondary);">Likes</div>
+                                        </div>
+                                        <div>
+                                            <div style="font-size: 1.5rem; color: #10b981;">
+                                                <i class="fas fa-comment"></i>
+                                            </div>
+                                            <div style="color: var(--text-primary);"><?= number_format($creator['comments_received']) ?></div>
+                                            <div style="font-size: 0.8em; color: var(--text-secondary);">Comments</div>
+                                        </div>
+                                    </div>
+                                </div>
+                            <?php endforeach; ?>
+                        </div>
+                    <?php endif; ?>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <script src="../assets/js/theme-switcher.js?v=<?= time() ?>"></script>
+    <script>
+        // User Growth Chart
+        document.addEventListener('DOMContentLoaded', function() {
+            const ctx = document.getElementById('userGrowthChart').getContext('2d');
+            
+            // Prepare data
+            const dates = [
+                <?php 
+                $dateLabels = [];
+                $userCounts = [];
+                $currentDate = new DateTime();
+                for ($i = 29; $i >= 0; $i--) {
+                    $date = clone $currentDate;
+                    $date->sub(new DateInterval("P{$i}D"));
+                    $dateLabels[] = $date->format('M j');
+                    $userCounts[] = 0;
+                }
+                
+                // Fill in actual data
+                foreach ($dailyUserGrowth as $data) {
+                    $index = array_search(date('M j', strtotime($data['date'])), $dateLabels);
+                    if ($index !== false) {
+                        $userCounts[$index] = $data['count'];
+                    }
+                }
+                
+                echo '"' . implode('", "', $dateLabels) . '"';
+                ?>
+            ];
+            
+            const counts = [<?= implode(', ', $userCounts) ?>];
+            
+            new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: dates,
+                    datasets: [{
+                        label: 'New Users',
+                        data: counts,
+                        borderColor: '#6366f1',
+                        backgroundColor: 'rgba(99, 102, 241, 0.1)',
+                        tension: 0.4,
+                        fill: true
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    plugins: {
+                        legend: { display: false }
+                    },
+                    scales: {
+                        y: {
+                            beginAtZero: true,
+                            grid: { color: 'rgba(255, 255, 255, 0.1)' }
+                        },
+                        x: {
+                            grid: { display: false }
+                        }
+                    }
+                }
+            });
+        });
+    </script>
+</body>
+</html>

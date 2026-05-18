@@ -1,6 +1,7 @@
 <?php
 // includes/economy.php – Complete economy engine for AkkuApps.in
 // All functions: inventory, shop, stats, commissions, UPI, treasury, likes, comments, badges, tokens, subscriptions
+require_once __DIR__ . '/notifications.php';
 
 if (!defined('AKKUAPPS_LOADED')) exit;
 
@@ -182,6 +183,55 @@ function getDefaultCommission(string $key): float {
     return $defaults[$key] ?? 0;
 }
 
+function getTreasuryAdminId(): ?string {
+    global $pdo;
+
+    try {
+        $stmt = $pdo->query("SELECT user_id FROM users WHERE role = 'admin' ORDER BY created_at ASC LIMIT 1");
+        $adminId = $stmt->fetchColumn();
+        return $adminId !== false ? (string)$adminId : null;
+    } catch (Exception $e) {
+        return null;
+    }
+}
+
+function collectToTreasury(
+    string $type,
+    $sourceUserId,
+    float $feeAmount,
+    ?string $entityType = null,
+    $entityId = null,
+    $targetUserId = null,
+    float $grossAmount = 0.0,
+    float $feeRate = 0.0,
+    string $description = ''
+): int {
+    global $pdo;
+
+    if ($feeAmount <= 0) {
+        return 0;
+    }
+
+    $adminId = getTreasuryAdminId();
+    if (!$adminId) {
+        return 0;
+    }
+
+    $treasury = new AkkuCollectionBox($pdo, $adminId);
+
+    return $treasury->collect(
+        $type,
+        $sourceUserId,
+        $feeAmount,
+        $entityType,
+        $entityId,
+        $targetUserId,
+        $grossAmount,
+        $feeRate,
+        $description
+    );
+}
+
 // ========== GIFT HISTORY ==========
 
 function getGiftHistory(string $userId, string $type = 'all'): array {
@@ -284,160 +334,129 @@ function verifyPayment(string $paymentId, string $adminId, string $utr, string $
 
 // ========== NOTIFICATION SYSTEM ==========
 
-function createNotification(string $userId, string $type, string $title, string $message, string $referenceId = null, string $referenceType = null): bool {
+// ========== LIKE SYSTEM ==========
+
+// Fix Like System
+function likePost($postId, $userId) {
+    
     global $pdo;
+    
     try {
-        $pdo->prepare("
-            INSERT INTO notifications (notification_id, user_id, type, title, message, reference_id, reference_type, is_read, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 0, NOW())
-        ")->execute([generateUUID(), $userId, $type, $title, $message, $referenceId, $referenceType]);
+        $pdo->beginTransaction();
+        
+        // Get post owner
+        $stmt = $pdo->prepare("SELECT user_id FROM user_posts WHERE post_id = ?");
+        $stmt->execute([$postId]);
+        $post = $stmt->fetch();
+        
+        if (!$post) {
+            throw new Exception("Post not found");
+        }
+        
+        // Prevent self-like farming
+        if ($post['user_id'] === $userId) {
+            throw new Exception("Cannot like own post");
+        }
+        
+        // Check if already liked
+        $stmt = $pdo->prepare("SELECT like_id FROM post_likes WHERE post_id = ? AND user_id = ?");
+        $stmt->execute([$postId, $userId]);
+        if ($stmt->fetch()) {
+            throw new Exception("Already liked");
+        }
+        
+        // Charge viewer 2 coins
+        $stmt = $pdo->prepare("
+            UPDATE users 
+            SET coin_balance = coin_balance - 2.0000 
+            WHERE user_id = ? AND coin_balance >= 2.0000
+        ");
+        $stmt->execute([$userId]);
+        
+        if ($stmt->rowCount() === 0) {
+            throw new Exception("Insufficient coins");
+        }
+        
+        // Reward owner 1 coin
+        $stmt = $pdo->prepare("
+            UPDATE users 
+            SET coin_balance = coin_balance + 1.0000 
+            WHERE user_id = ?
+        ");
+        $stmt->execute([$post['user_id']]);
+        
+        // Platform keeps 1 coin (fee)
+        $platformFee = 1.0000;
+        
+        // Record like transaction for viewer
+        $stmt = $pdo->prepare("
+            INSERT INTO coin_transactions 
+            (txn_id, user_id, reference_type, reference_id, amount, balance_after, description, related_user_id, collection_box_fee) 
+            VALUES (?, ?, 'like_given', ?, -2.0000, 
+                   (SELECT coin_balance FROM users WHERE user_id = ?), 
+                   'Liked post', ?, ?)
+        ");
+        $stmt->execute([generateUUID(), $userId, $postId, $userId, $post['user_id'], $platformFee]);
+        
+        // Record like transaction for owner
+        $stmt = $pdo->prepare("
+            INSERT INTO coin_transactions 
+            (txn_id, user_id, reference_type, reference_id, amount, balance_after, description, related_user_id) 
+            VALUES (?, ?, 'like_received', ?, 1.0000, 
+                   (SELECT coin_balance FROM users WHERE user_id = ?), 
+                   'Received like', ?)
+        ");
+        $stmt->execute([generateUUID(), $post['user_id'], $postId, $post['user_id'], $userId]);
+        
+        // Record platform fee in collection box
+        collectToTreasury(
+            'post_like',
+            $userId,
+            $platformFee,
+            'post',
+            $postId,
+            $post['user_id'],
+            2.0000,
+            50.00,
+            "Like fee on post #{$postId}"
+        );
+        
+        // Add like record
+        $stmt = $pdo->prepare("
+            INSERT INTO post_likes (like_id, post_id, user_id, coin_spent, coin_earned_by_owner, created_at) 
+            VALUES (?, ?, ?, 2.0000, 1.0000, NOW())
+        ");
+        $stmt->execute([generateUUID(), $postId, $userId]);
+        
+        // Update post likes count
+        $pdo->prepare("UPDATE user_posts SET likes_count = likes_count + 1 WHERE post_id = ?")
+            ->execute([$postId]);
+        
+        $pdo->commit();
         return true;
+        
     } catch (Exception $e) {
-        error_log('Notification error: ' . $e->getMessage());
+        $pdo->rollback();
+        error_log("Like error: " . $e->getMessage());
         return false;
     }
 }
 
-function getUnreadNotifications(string $userId): array {
-    global $pdo;
-    try {
-        $stmt = $pdo->prepare("
-            SELECT * FROM notifications 
-            WHERE user_id = ? AND is_read = 0 
-            ORDER BY created_at DESC LIMIT 20
-        ");
-        $stmt->execute([$userId]);
-        return $stmt->fetchAll();
-    } catch (Exception $e) {
-        return [];
-    }
+// Collection Box Function
+function recordCollectionBoxTransaction($type, $amount, $sourceUserId = null, $targetUserId = null, $entityType = null, $entityId = null) {
+    return collectToTreasury(
+        (string)$type,
+        $sourceUserId,
+        (float)$amount,
+        $entityType,
+        $entityId,
+        $targetUserId,
+        (float)$amount,
+        100.00,
+        ucfirst(str_replace('_', ' ', (string)$type))
+    );
 }
 
-function markNotificationsRead(string $userId): void {
-    global $pdo;
-    try {
-        $pdo->prepare("UPDATE notifications SET is_read = 1 WHERE user_id = ? AND is_read = 0")
-            ->execute([$userId]);
-    } catch (Exception $e) {}
-}
-
-// ========== LIKE SYSTEM ==========
-
-function likePost(string $userId, string $postId): array {
-    global $pdo;
-
-    $cost = getCommissionSetting('post_like_cost');
-    $reward = getCommissionSetting('post_like_reward');
-
-    try {
-        $pdo->beginTransaction();
-
-        // Check if already liked
-        $check = $pdo->prepare("SELECT like_id FROM post_likes WHERE post_id = ? AND user_id = ?");
-        $check->execute([$postId, $userId]);
-        if ($check->fetch()) {
-            return ['success' => false, 'error' => 'Already liked'];
-        }
-
-        // Get post owner
-        $postStmt = $pdo->prepare("SELECT user_id FROM user_posts WHERE post_id = ?");
-        $postStmt->execute([$postId]);
-        $postOwner = $postStmt->fetchColumn();
-        if (!$postOwner) {
-            return ['success' => false, 'error' => 'Post not found'];
-        }
-
-        // Check viewer balance
-        $viewerStmt = $pdo->prepare("SELECT coin_balance FROM users WHERE user_id = ? FOR UPDATE");
-        $viewerStmt->execute([$userId]);
-        $viewerBalance = (float)$viewerStmt->fetchColumn();
-
-        if ($viewerBalance < $cost) {
-            return ['success' => false, 'error' => "Need {$cost} coins to like. You have {$viewerBalance}"];
-        }
-
-        // Deduct from viewer
-        $newViewerBalance = $viewerBalance - $cost;
-        $pdo->prepare("UPDATE users SET coin_balance = ? WHERE user_id = ?")
-            ->execute([$newViewerBalance, $userId]);
-
-        // Record viewer transaction
-        $pdo->prepare("
-            INSERT INTO coin_transactions 
-            (txn_id, user_id, reference_type, reference_id, amount, balance_after, description, created_at)
-            VALUES (?, ?, 'like_given', ?, ?, ?, ?, NOW())
-        ")->execute([
-            generateUUID(), $userId, $postId, -$cost, $newViewerBalance,
-            "Liked post #{$postId}"
-        ]);
-
-        // Reward post owner
-        $pdo->prepare("UPDATE users SET coin_balance = coin_balance + ? WHERE user_id = ?")
-            ->execute([$reward, $postOwner]);
-
-        // Record owner reward
-        $ownerBalanceStmt = $pdo->prepare("SELECT coin_balance FROM users WHERE user_id = ?");
-        $ownerBalanceStmt->execute([$postOwner]);
-        $ownerNewBalance = (float)$ownerBalanceStmt->fetchColumn();
-
-        $pdo->prepare("
-            INSERT INTO coin_transactions 
-            (txn_id, user_id, reference_type, reference_id, amount, balance_after, description, created_at)
-            VALUES (?, ?, 'like_received', ?, ?, ?, ?, NOW())
-        ")->execute([
-            generateUUID(), $postOwner, $postId, $reward, $ownerNewBalance,
-            "Like reward from post #{$postId}",
-        ]);
-
-        // Insert like record
-        $pdo->prepare("
-            INSERT INTO post_likes (like_id, post_id, user_id, coin_spent, coin_earned_by_owner, created_at)
-            VALUES (?, ?, ?, ?, ?, NOW())
-        ")->execute([generateUUID(), $postId, $userId, $cost, $reward]);
-
-        // Update post likes_count
-        $pdo->prepare("UPDATE user_posts SET likes_count = likes_count + 1 WHERE post_id = ?")
-            ->execute([$postId]);
-
-        // CollectionBox fee
-        $fee = $cost - $reward;
-        if ($fee > 0) {
-            $adminStmt = $pdo->query("SELECT user_id FROM users WHERE role = 'admin' LIMIT 1");
-            $adminId = (int)($adminStmt->fetchColumn() ?: 0);
-            if ($adminId) {
-                $treasury = new AkkuCollectionBox($pdo, $adminId);
-                $treasury->collect(
-                    'post_like',
-                    (int)$userId,
-                    $fee,
-                    'post',
-                    (int)$postId,
-                    (int)$postOwner,
-                    $cost,
-                    0,
-                    "Like fee on post #{$postId}: {$cost} cost - {$reward} reward = {$fee} fee"
-                );
-            }
-        }
-
-        // Notify post owner
-        createNotification($postOwner, 'like', 'New Like!', 'Someone liked your post', $postId, 'post');
-
-        $pdo->commit();
-
-        return [
-            'success' => true,
-            'message' => "Liked! -{$cost} 🪙",
-            'new_balance' => $newViewerBalance,
-            'owner_rewarded' => $reward
-        ];
-
-    } catch (Exception $e) {
-        $pdo->rollBack();
-        error_log('likePost error: ' . $e->getMessage());
-        return ['success' => false, 'error' => 'Like failed: ' . $e->getMessage()];
-    }
-}
 
 function unlikePost(string $userId, string $postId): array {
     global $pdo;
@@ -549,22 +568,18 @@ function commentOnPost(string $userId, string $postId, string $content): array {
         // CollectionBox fee
         $fee = $cost - $reward;
         if ($fee > 0) {
-            $adminStmt = $pdo->query("SELECT user_id FROM users WHERE role = 'admin' LIMIT 1");
-            $adminId = (int)($adminStmt->fetchColumn() ?: 0);
-            if ($adminId) {
-                $treasury = new AkkuCollectionBox($pdo, $adminId);
-                $treasury->collect(
-                    'post_comment',
-                    (int)$userId,
-                    $fee,
-                    'post',
-                    (int)$postId,
-                    (int)$postOwner,
-                    $cost,
-                    0,
-                    "Comment fee on post #{$postId}: {$cost} cost - {$reward} reward = {$fee} fee"
-                );
-            }
+            $feeRate = $cost > 0 ? round(($fee / $cost) * 100, 2) : 0;
+            collectToTreasury(
+                'post_comment',
+                $userId,
+                $fee,
+                'post',
+                $postId,
+                $postOwner,
+                $cost,
+                $feeRate,
+                "Comment fee on post #{$postId}: {$cost} cost - {$reward} reward = {$fee} fee"
+            );
         }
 
         // Notify post owner
@@ -670,22 +685,18 @@ function repostPost(string $userId, string $postId, string $comment = ''): array
         // CollectionBox fee: repost_cost - repost_reward = platform keeps the difference
         $platformFee = $repostCost - $repostReward;
         if ($platformFee > 0) {
-            $adminStmt = $pdo->query("SELECT user_id FROM users WHERE role = 'admin' LIMIT 1");
-            $adminId = (int)($adminStmt->fetchColumn() ?: 0);
-            if ($adminId) {
-                $treasury = new AkkuCollectionBox($pdo, $adminId);
-                $treasury->collect(
-                    'repost',
-                    (int)$userId,
-                    $platformFee,
-                    'post',
-                    (int)$postId,
-                    (int)$original['user_id'],
-                    $repostCost,
-                    0,
-                    "Repost fee: {$repostCost} cost - {$repostReward} reward = {$platformFee} platform fee"
-                );
-            }
+            $feeRate = $repostCost > 0 ? round(($platformFee / $repostCost) * 100, 2) : 0;
+            collectToTreasury(
+                'repost',
+                $userId,
+                $platformFee,
+                'post',
+                $postId,
+                $original['user_id'],
+                $repostCost,
+                $feeRate,
+                "Repost fee: {$repostCost} cost - {$repostReward} reward = {$platformFee} platform fee"
+            );
         }
 
         // Notify original poster
@@ -753,32 +764,24 @@ function buyBadge(string $userId, string $badgeId): array {
             $pdo->prepare("
                 INSERT INTO coin_transactions 
                 (txn_id, user_id, reference_type, reference_id, amount, balance_after, description, created_at)
-                VALUES (?, ?, 'purchase', ?, ?, ?, ?, NOW())
+                VALUES (?, ?, 'badge_purchase', ?, ?, ?, ?, NOW())
             ")->execute([
                 generateUUID(), $userId, $badgeId, -$price, $newBalance,
                 "Purchased badge: {$badge['name']}"
             ]);
 
-            // CollectionBox fee (5%)
-            $fee = round($price * 0.05, 4);
-            if ($fee > 0) {
-                $adminStmt = $pdo->query("SELECT user_id FROM users WHERE role = 'admin' LIMIT 1");
-                $adminId = (int)($adminStmt->fetchColumn() ?: 0);
-                if ($adminId) {
-                    $treasury = new AkkuCollectionBox($pdo, $adminId);
-                    $treasury->collect(
-                        'badge_purchase',
-                        (int)$userId,
-                        $fee,
-                        'badge',
-                        (int)$badgeId,
-                        null,
-                        $price,
-                        5,
-                        "Badge purchase fee: {$badge['name']} ({$price} coins)"
-                    );
-                }
-            }
+            // Admin-created digital goods route the full sale value to treasury.
+            collectToTreasury(
+                'badge_sale',
+                $userId,
+                $price,
+                'badge',
+                $badgeId,
+                null,
+                $price,
+                100,
+                "Badge sale credited to treasury: {$badge['name']} ({$price} coins)"
+            );
         }
 
         // Add badge to user
@@ -860,22 +863,17 @@ function buyToken(string $userId, string $tokenId, int $quantity = 1): array {
         // CollectionBox fee (5%)
         $fee = round($totalCost * 0.05, 4);
         if ($fee > 0) {
-            $adminStmt = $pdo->query("SELECT user_id FROM users WHERE role = 'admin' LIMIT 1");
-            $adminId = (int)($adminStmt->fetchColumn() ?: 0);
-            if ($adminId) {
-                $treasury = new AkkuCollectionBox($pdo, $adminId);
-                $treasury->collect(
-                    'token_purchase',
-                    (int)$userId,
-                    $fee,
-                    'token',
-                    (int)$tokenId,
-                    null,
-                    $totalCost,
-                    5,
-                    "Token purchase fee: {$quantity}x {$token['name']} ({$totalCost} coins)"
-                );
-            }
+            collectToTreasury(
+                'token_purchase',
+                $userId,
+                $fee,
+                'token',
+                $tokenId,
+                null,
+                $totalCost,
+                5,
+                "Token purchase fee: {$quantity}x {$token['name']} ({$totalCost} coins)"
+            );
         }
 
         $pdo->commit();
@@ -900,94 +898,78 @@ function buyToken(string $userId, string $tokenId, int $quantity = 1): array {
 // ========== POST CREATION ==========
 // ========== POST CREATION (CHARGED, NOT REWARDED) ==========
 
-function createPost(string $userId, string $content, array $mediaUrls = [], string $visibility = 'public', ?string $tokenId = null, float $coinPrice = 0): array {
+// Change this function:
+// Change this function:
+function createPost($userId, $content, $mediaUrls = []) {
     global $pdo;
 
-    if (empty(trim($content)) && empty($mediaUrls)) {
-        return ['success' => false, 'error' => 'Post must have text or media'];
+    $content = trim((string)$content);
+    $postCost = getCommissionSetting('post_creation_cost');
+
+    if ($content === '') {
+        return ['success' => false, 'error' => 'Post content cannot be empty'];
     }
-
-    // Post creation cost: 2 coins
-    $postCost = 2.00;
-
+    
     try {
         $pdo->beginTransaction();
-
-        // Check user has enough balance
-        $balStmt = $pdo->prepare("SELECT coin_balance FROM users WHERE user_id = ? FOR UPDATE");
-        $balStmt->execute([$userId]);
-        $balance = (float)$balStmt->fetchColumn();
-
-        if ($balance < $postCost) {
-            return ['success' => false, 'error' => "Need {$postCost} coins to post. You have {$balance}"];
+        
+        // Charge the fixed creation cost up front.
+        $stmt = $pdo->prepare("
+            UPDATE users 
+            SET coin_balance = coin_balance - ? 
+            WHERE user_id = ? AND coin_balance >= ?
+        ");
+        $stmt->execute([$postCost, $userId, $postCost]);
+        
+        if ($stmt->rowCount() === 0) {
+            throw new Exception("Insufficient coins");
         }
-
-        $postId = generateUUID();
-        $mediaJson = !empty($mediaUrls) ? json_encode($mediaUrls) : null;
-        $status = 'active';
-
+        
         // Insert post
-        $pdo->prepare("
-            INSERT INTO user_posts 
-            (post_id, user_id, content, media_urls, visibility, status, likes_count, comments_count, view_count, coins_earned, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0, 0, NOW())
-        ")->execute([$postId, $userId, $content, $mediaJson, $visibility, $status]);
-
-        // DEDUCT 2 coins from user (CHARGE, not reward)
-        $newBalance = $balance - $postCost;
-        $pdo->prepare("UPDATE users SET coin_balance = ? WHERE user_id = ?")
-            ->execute([$newBalance, $userId]);
-
-        // Record transaction as EXPENSE
-        $pdo->prepare("
+        $postId = generateUUID();
+        $stmt = $pdo->prepare("
+            INSERT INTO user_posts (post_id, user_id, content, media_urls, created_at) 
+            VALUES (?, ?, ?, ?, NOW())
+        ");
+        $stmt->execute([$postId, $userId, $content, json_encode($mediaUrls)]);
+        
+        // Record transaction
+        $stmt = $pdo->prepare("
             INSERT INTO coin_transactions 
-            (txn_id, user_id, reference_type, reference_id, amount, balance_after, description, created_at)
-            VALUES (?, ?, 'post_create', ?, ?, ?, ?, NOW())
-        ")->execute([
-            generateUUID(), $userId, $postId, -$postCost, $newBalance,
-            "Charged {$postCost} coins for creating post #{$postId}"
-        ]);
+            (txn_id, user_id, reference_type, amount, balance_after, description, created_at) 
+            VALUES (?, ?, 'post_creation', ?, 
+                   (SELECT coin_balance FROM users WHERE user_id = ?), 
+                   'Post creation fee', NOW())
+        ");
+        $stmt->execute([generateUUID(), $userId, -$postCost, $userId]);
 
-        // CollectionBox fee collection (optional: 10% platform fee on post creation)
-        // If you want admin to get a cut, uncomment below:
-        /*
-        $platformFee = round($postCost * 0.10, 4); // 10% = 0.2 coins
-        if ($platformFee > 0) {
-            $adminStmt = $pdo->query("SELECT user_id FROM users WHERE role = 'admin' LIMIT 1");
-            $adminId = (int)($adminStmt->fetchColumn() ?: 0);
-            if ($adminId) {
-                $treasury = new AkkuCollectionBox($pdo, $adminId);
-                $treasury->collect(
-                    'PostId_Charges',
-                    (int)$userId,
-                    $platformFee,
-                    'post',
-                    (int)$postId,
-                    null,
-                    $postCost,
-                    10,
-                    "Post creation fee: {$postCost} coins from user #{$userId}"
-                );
-            }
-        }
-        */
-
+        collectToTreasury(
+            'post_creation',
+            $userId,
+            $postCost,
+            'post',
+            $postId,
+            null,
+            $postCost,
+            100,
+            "Post creation fee collected for post #{$postId}"
+        );
+        
         $pdo->commit();
-
         return [
             'success' => true,
-            'message' => "Post created! -{$postCost} 🪙 charged",
             'post_id' => $postId,
-            'new_balance' => $newBalance,
             'cost' => $postCost
         ];
-
+        
     } catch (Exception $e) {
-        $pdo->rollBack();
-        error_log('createPost error: ' . $e->getMessage());
-        return ['success' => false, 'error' => 'Post creation failed: ' . $e->getMessage()];
+        $pdo->rollback();
+        error_log("Post creation error: " . $e->getMessage());
+        return ['success' => false, 'error' => $e->getMessage()];
     }
 }
+
+
 // ========== TOKEN CONVERSION ==========
 
 function convertTokenToCoins(string $userId, string $tokenId, int $quantity, ?string $adminId = null): array {
@@ -1063,14 +1045,13 @@ function convertTokenToCoins(string $userId, string $tokenId, int $quantity, ?st
         ]);
 
         // Collect commission to CollectionBox
-        if ($commission > 0 && $adminId) {
-            $treasury = new AkkuCollectionBox($pdo, (int)$adminId);
-            $treasury->collect(
+        if ($commission > 0) {
+            collectToTreasury(
                 'token_conversion',
-                (int)$userId,
+                $userId,
                 $commission,
                 'token',
-                (int)$tokenId,
+                $tokenId,
                 null,
                 $totalCoinValue,
                 $commissionRate,
@@ -1212,6 +1193,22 @@ function subscribeToCreator(string $subscriberId, string $creatorId, float $pric
         // Credit creator (90%)
         $creatorShare = round($price * 0.90, 4);
         $platformFee = $price - $creatorShare;
+        $reportedPlatformFee = $platformFee;
+
+        if ($platformFee > 0) {
+            collectToTreasury(
+                'subscription',
+                $subscriberId,
+                $platformFee,
+                'creator',
+                $creatorId,
+                $creatorId,
+                $price,
+                10,
+                "Subscription platform fee: {$subscriberId} -> {$creator['name']} ({$price} coins)"
+            );
+            $platformFee = 0;
+        }
 
         $pdo->prepare("UPDATE users SET coin_balance = coin_balance + ? WHERE user_id = ?")
             ->execute([$creatorShare, $creatorId]);
@@ -1269,7 +1266,7 @@ function subscribeToCreator(string $subscriberId, string $creatorId, float $pric
             'subscription_id' => $subId,
             'expires_at' => date('Y-m-d H:i:s', strtotime('+30 days')),
             'creator_earned' => $creatorShare,
-            'platform_fee' => $platformFee,
+            'platform_fee' => $reportedPlatformFee,
             'new_balance' => $newBalance
         ];
 
@@ -1364,22 +1361,17 @@ function recordPostView(string $postId, string $viewerId = null, string $viewerI
         // CollectionBox fee on views (10%)
         $fee = round($reward * 0.10, 4);
         if ($fee > 0) {
-            $adminStmt = $pdo->query("SELECT user_id FROM users WHERE role = 'admin' LIMIT 1");
-            $adminId = (int)($adminStmt->fetchColumn() ?: 0);
-            if ($adminId) {
-                $treasury = new AkkuCollectionBox($pdo, $adminId);
-                $treasury->collect(
-                    'post_view',
-                    $viewerId ? (int)$viewerId : 0,
-                    $fee,
-                    'post',
-                    (int)$postId,
-                    (int)$postOwner,
-                    $reward,
-                    10,
-                    "View reward fee on post #{$postId}"
-                );
-            }
+            collectToTreasury(
+                'post_view',
+                $viewerId,
+                $fee,
+                'post',
+                $postId,
+                $postOwner,
+                $reward,
+                10,
+                "View reward fee on post #{$postId}"
+            );
         }
 
         $pdo->commit();
@@ -1404,12 +1396,12 @@ function recordPostView(string $postId, string $viewerId = null, string $viewerI
 
 class AkkuCollectionBox {
     private PDO $db;
-    private int $adminId;
+    private $adminId;
 
     private const GIFT_SEND_FEE = 10;
     private const CONVERSION_RATE = 10;
 
-    public function __construct(PDO $db, int $adminId = 0) {
+    public function __construct(PDO $db, $adminId = null) {
         $this->db = $db;
         $this->adminId = $adminId;
     }
@@ -1430,11 +1422,11 @@ class AkkuCollectionBox {
 
     public function collect(
         string $type,
-        int $sourceUserId,
+        $sourceUserId,
         float $feeAmount,
         string $entityType = null,
-        int $entityId = null,
-        int $targetUserId = null,
+        $entityId = null,
+        $targetUserId = null,
         float $grossAmount = 0,
         float $feeRate = 0,
         string $description = ''

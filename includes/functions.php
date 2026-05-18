@@ -77,6 +77,66 @@ function verifyCSRFToken(string $token): bool {
     return $valid;
 }
 
+function getUserFollowersCount($userId) {
+    global $pdo;
+    try {
+        $stmt = $pdo->prepare("SELECT COUNT(*) FROM user_follows WHERE following_id = ? AND status = 'accepted'");
+        $stmt->execute([$userId]);
+        return $stmt->fetchColumn();
+    } catch (Exception $e) {
+        return 0;
+    }
+}
+
+function getUserFollowingCount($userId) {
+    global $pdo;
+    try {
+        $stmt = $pdo->prepare("SELECT COUNT(*) FROM user_follows WHERE follower_id = ? AND status = 'accepted'");
+        $stmt->execute([$userId]);
+        return $stmt->fetchColumn();
+    } catch (Exception $e) {
+        return 0;
+    }
+}
+
+function isUserFollowing($followerId, $followingId) {
+    global $pdo;
+    try {
+        $stmt = $pdo->prepare("SELECT id FROM user_follows WHERE follower_id = ? AND following_id = ? AND status = 'accepted'");
+        $stmt->execute([$followerId, $followingId]);
+        return $stmt->fetch() !== false;
+    } catch (Exception $e) {
+        return false;
+    }
+}
+
+function getUserRelationshipStatus($userId1, $userId2) {
+    global $pdo;
+    try {
+        $stmt = $pdo->prepare("
+            SELECT status, relationship_type FROM user_follows 
+            WHERE (follower_id = ? AND following_id = ?) 
+            OR (follower_id = ? AND following_id = ?)
+        ");
+        $stmt->execute([$userId1, $userId2, $userId2, $userId1]);
+        return $stmt->fetch();
+    } catch (Exception $e) {
+        return null;
+    }
+}
+
+function generateInviteCode($userId) {
+    global $pdo;
+    try {
+        $inviteCode = 'INV' . strtoupper(substr(md5($userId . time()), 0, 10));
+        $pdo->prepare("UPDATE users SET invite_code = ? WHERE user_id = ?")
+            ->execute([$inviteCode, $userId]);
+        return $inviteCode;
+    } catch (Exception $e) {
+        return null;
+    }
+}
+
 // ---------------------------------------------------
 // ---------- Coin / reward system ----------
 function awardCoins(string $userId, string $type, $referenceId = null, string $description = null): bool {

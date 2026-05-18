@@ -13,21 +13,21 @@ if (!$user) {
 }
 
 $postId = $_POST['post_id'] ?? null;
-$comment = trim($_POST['comment'] ?? '');
+$content = trim($_POST['content'] ?? '');
 
 if (!$postId) {
     echo json_encode(['success' => false, 'error' => 'Post ID required']);
     exit;
 }
 
-$result = repostPost($user['user_id'], $postId, $comment);
+$result = commentOnPost($user['user_id'], $postId, $content);
 
 if (!empty($result['success'])) {
     $updatedUser = getCurrentUser();
     echo json_encode([
         'success' => true,
-        'message' => $result['message'] ?? 'Post reposted.',
-        'repost_id' => $result['repost_id'] ?? null,
+        'message' => $result['message'] ?? 'Comment added.',
+        'comment_id' => $result['comment_id'] ?? null,
         'new_balance' => $updatedUser['coin_balance'] ?? null
     ]);
     exit;
@@ -35,5 +35,5 @@ if (!empty($result['success'])) {
 
 echo json_encode([
     'success' => false,
-    'error' => $result['error'] ?? 'Unable to repost post'
+    'error' => $result['error'] ?? 'Unable to add comment'
 ]);
